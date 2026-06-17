@@ -75,6 +75,20 @@ if which lsb_release &> /dev/null; then
 fi
 echo "Detected Linux distribution: $DIST $RELEASE $CODENAME $ARCH"
 
+# --- Ubuntu 26.04 / PEP 668 support ---------------------------------
+# Ubuntu 23.04+ and Debian 12+ mark the system Python as
+# "externally managed" (PEP 668), which blocks pip from installing
+# into it. Allow it explicitly so the Mininet install can proceed.
+PIP_BREAK=""
+if [ "$DIST" = "Ubuntu" ] && [ `expr $RELEASE '>=' 23.04` = "1" ]; then
+    PIP_BREAK="--break-system-packages"
+fi
+if [ "$DIST" = "Debian" ] && [ `expr $RELEASE '>=' 12` = "1" ]; then
+    PIP_BREAK="--break-system-packages"
+fi
+# --------------------------------------------------------------------
+
+
 # Kernel params
 
 KERNEL_NAME=`uname -r`
@@ -103,10 +117,10 @@ function version_ge {
 }
 
 # Attempt to detect Python version
-PYTHON=${PYTHON:-python}
+PYTHON=${PYTHON:-python3}
 PRINTVERSION='import sys; print(sys.version_info)'
 PYTHON_VERSION=unknown
-for python in $PYTHON python2 python3; do
+for python in $PYTHON python3 python2; do
     if $python -c "$PRINTVERSION" |& grep 'major=2'; then
         PYTHON=$python; PYTHON_VERSION=2; PYPKG=python
         break
@@ -188,6 +202,10 @@ function mn_deps {
                 pep8=python3-pep8
         fi
 
+        if [ "$DIST" = "Ubuntu" ] &&  [ `expr $RELEASE '>=' 24.04` = "1" ]; then
+            pep8=pycodestyle
+        fi
+        
         $install gcc make socat psmisc xterm ssh iperf telnet \
                  ethtool help2man $pf pylint $pep8 \
                  net-tools ${PYPKG}-tk
@@ -200,18 +218,20 @@ function mn_deps {
             else
                 wget https://bootstrap.pypa.io/get-pip.py
             fi
-            sudo ${PYTHON} get-pip.py
+            # --ignore-installed avoids "uninstall-no-record-file" against
+            sudo ${PYTHON} get-pip.py $PIP_BREAK --ignore-installed
             rm get-pip.py
         fi
-       ${python} -m pip install pexpect
+       ${PYTHON} -m pip install $PIP_BREAK pexpect
         $install iproute2 || $install iproute
         $install cgroup-tools || $install cgroup-bin
-        $install cgroupfs-mount
+        # $install cgroupfs-mount
     fi
 
     echo "Installing Mininet core"
     pushd $MININET_DIR/mininet
-    sudo PYTHON=${PYTHON} make install
+    # PIP_BREAK_SYSTEM_PACKAGES is honored by the pip call inside the Makefile
+    sudo PYTHON=${PYTHON} PIP_BREAK_SYSTEM_PACKAGES=1 make install
     popd
 }
 
@@ -242,7 +262,12 @@ function of {
     fi
     # was: git clone git://openflowswitch.org/openflow.git
     # Use our own fork on github for now:
-    git clone https://github.com/mininet/openflow
+    # Only clone if the openflow folder isn't already present
+    if [ ! -d "$BUILD_DIR/openflow" ]; then
+        git clone https://github.com/mshanak/openflow
+    else
+        echo "openflow directory already exists at $BUILD_DIR/openflow - skipping clone"
+    fi
     cd $BUILD_DIR/openflow
 
     # Patch controller to handle more than 16 switches
@@ -636,7 +661,7 @@ function oftest {
 
     # Install deps:
     $install tcpdump
-    $install ${PYPKG}-scapy || sudo $PYTHON -m pip install scapy
+    $install ${PYPKG}-scapy || sudo $PYTHON -m pip install $PIP_BREAK scapy
 
     # Install oftest:
     cd $BUILD_DIR/

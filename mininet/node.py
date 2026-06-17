@@ -69,7 +69,7 @@ from mininet.util import ( quietRun, errRun, errFail, moveIntf, isShellBuiltin,
                            StrictVersion )
 from mininet.moduledeps import moduleDeps, pathCheck, TUN
 from mininet.link import Link, Intf, TCIntf, OVSIntf
-
+from pathlib import Path
 
 # pylint: disable=too-many-arguments
 
@@ -684,6 +684,14 @@ class Host( Node ):
 class CPULimitedHost( Host ):
 
     "CPU limited host"
+    CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+    CGROUP_V2_FILES = {
+        ("cpu", "max"): "cpu.max",
+        ("cpu", "weight"): "cpu.weight",
+        ("cpuset", "cpus"): "cpuset.cpus",
+        ("cpuset", "mems"): "cpuset.mems",
+    }
 
     def __init__( self, name, sched='cfs', **params ):
         Host.__init__( self, name, **params )
@@ -695,65 +703,219 @@ class CPULimitedHost( Host ):
         self.sched = sched
         self.cgroupsInited = False
         self.cgroup, self.rtprio = None, None
+        self.cgroup_path = None
 
     def initCgroups( self ):
         "Deferred cgroup initialization"
+
         if self.cgroupsInited:
             return
+
         # Initialize class if necessary
         if not CPULimitedHost.inited:
             CPULimitedHost.init()
-        # Create a cgroup and move shell into it
-        self.cgroup = 'cpu,cpuacct,cpuset:/' + self.name
-        errFail( 'cgcreate -g ' + self.cgroup )
-        # We don't add ourselves to a cpuset because you must
-        # specify the cpu and memory placement first
-        errFail( 'cgclassify -g cpu,cpuacct:/%s %s' % ( self.name, self.pid ) )
-        if self.sched == 'rt':
+
+        if self.cgversion != "cgroup2":
+            # ---- cgroup v1 ----
+            self.cgroup = "cpu,cpuacct,cpuset:/" + self.name
+            errFail( "cgcreate -g " + self.cgroup )
+            # We don't add ourselves to a cpuset because you must
+            # specify the cpu and memory placement first
+            errFail(
+                "cgclassify -g cpu,cpuacct:/%s %s"
+                % ( self.name, self.pid )
+            )
+        else:
+            # ---- cgroup v2 (unified hierarchy) ----
+            self.cgroup_path = self.CGROUP_ROOT / self.name
+            self.cgroup_path.mkdir( exist_ok=True )
+
+            controllers = set(
+                ( self.CGROUP_ROOT / "cgroup.controllers" )
+                .read_text()
+                .split()
+            )
+
+            required = { "cpu", "cpuset" }
+            missing = required - controllers
+
+            if missing:
+                raise Exception(
+                    "Missing cgroup v2 controllers: %s"
+                    % ", ".join( sorted( missing ) )
+                )
+
+            subtree = self.CGROUP_ROOT / "cgroup.subtree_control"
+
+            try:
+                current = set( subtree.read_text().split() )
+
+                enable = [
+                    "+%s" % ctrl
+                    for ctrl in required
+                    if ctrl not in current
+                ]
+
+                if enable:
+                    with open( subtree, "w" ) as f:
+                        f.write( " ".join( enable ) )
+
+            except OSError:
+                warn(
+                    "*** Warning: unable to enable controllers in "
+                    "cgroup.subtree_control\n"
+                )
+
+            with open( self.cgroup_path / "cgroup.procs", "w" ) as f:
+                f.write( str( self.pid ) )
+
+        self.cgroupsInited = True
+
+        if self.sched == "rt":
+            # RT bandwidth control relies on rt_period_us/rt_runtime_us,
+            # which are NOT exposed by the cgroup v2 unified hierarchy.
+            if self.cgversion == "cgroup2":
+                raise Exception(
+                    "*** error: RT scheduling (sched='rt') is not "
+                    "supported under cgroup v2. "
+                    "Please use sched='cfs' instead.\n"
+                )
             self.checkRtGroupSched()
             self.rtprio = 20
 
-    def cgroupSet( self, param, value, resource='cpu' ):
+    def cgroupSet( self, param, value, resource="cpu" ):
         "Set a cgroup parameter and return its value"
-        cmd = [ 'cgset', '-r', "%s.%s=%s" % (
-            resource, param, value), '/' + self.name ]
+
+        if self.cgversion == "cgroup2":
+            filename = self.CGROUP_V2_FILES[ ( resource, param ) ]
+
+            with open( self.cgroup_path / filename, "w" ) as f:
+                f.write( str( value ) )
+
+            return self.cgroupGet( param, resource )
+
+        cmd = [
+            "cgset",
+            "-r",
+            "%s.%s=%s" % ( resource, param, value ),
+            "/" + self.name,
+        ]
+
         errFail( cmd )
+
         nvalue = self.cgroupGet( param, resource )
+
         if nvalue != str( value ):
-            error( '*** error: cgroupSet: %s set to %s instead of %s\n'
-                   % ( param, nvalue, value ) )
+            error(
+                "*** error: cgroupSet: %s set to %s instead of %s\n"
+                % ( param, nvalue, value )
+            )
+
         return nvalue
 
-    def cgroupGet( self, param, resource='cpu' ):
+    def cgroupGet( self, param, resource="cpu" ):
         "Return value of cgroup parameter"
-        pname = '%s.%s' % ( resource, param )
-        cmd = 'cgget -n -r %s /%s' % ( pname, self.name )
-        return quietRun( cmd )[len(pname)+1:].strip()
+
+        if self.cgversion == "cgroup2":
+            filename = self.CGROUP_V2_FILES[ ( resource, param ) ]
+
+            return (
+                self.cgroup_path / filename
+            ).read_text().strip()
+
+        pname = "%s.%s" % ( resource, param )
+
+        cmd = "cgget -n -r %s /%s" % ( pname, self.name )
+
+        return quietRun( cmd )[ len( pname ) + 1: ].strip()
 
     def cgroupDel( self ):
         "Clean up our cgroup"
-        # info( '*** deleting cgroup', self.cgroup, '\n' )
-        _out, _err, exitcode = errRun( 'cgdelete -r ' + self.cgroup )
+
+        if self.cgversion == "cgroup2":
+            try:
+                # Move any remaining PIDs back to the root cgroup so that
+                # the (now empty) cgroup directory can be removed.
+                procs = self.cgroup_path / "cgroup.procs"
+
+                if procs.exists():
+                    pids = procs.read_text().split()
+
+                    with open(
+                        self.CGROUP_ROOT / "cgroup.procs",
+                        "w"
+                    ) as root:
+                        for pid in pids:
+                            root.write( pid )
+
+                self.cgroup_path.rmdir()
+
+                return True
+
+            except OSError:
+                return False
+
+        _out, _err, exitcode = errRun(
+            "cgdelete -r " + self.cgroup
+        )
+
         # Sometimes cgdelete returns a resource busy error but still
         # deletes the group; next attempt will give "no such file"
-        return exitcode == 0 or ( 'no such file' in _err.lower() )
+        return exitcode == 0 or (
+            "no such file" in _err.lower()
+        )
 
     def popen( self, *args, **kwargs ):
         """Return a Popen() object in node's namespace
            args: Popen() args, single list, or string
            kwargs: Popen() keyword args"""
-        # Tell mnexec to execute command in our cgroup
-        mncmd = kwargs.pop( 'mncmd', [ 'mnexec', '-g', self.name,
-                                       '-da', str( self.pid ) ] )
-        # if our cgroup is not given any cpu time,
-        # we cannot assign the RR Scheduler.
-        if self.sched == 'rt':
-            if int( self.cgroupGet( 'rt_runtime_us', 'cpu' ) ) <= 0:
-                mncmd += [ '-r', str( self.rtprio ) ]
+
+        if self.cgversion == "cgroup2":
+            # Under cgroup v2 there is no per-controller -g path; the
+            # process is placed into our unified cgroup after it starts.
+            mncmd = kwargs.pop(
+                "mncmd",
+                [ "mnexec", "-da", str( self.pid ) ]
+            )
+        else:
+            # Tell mnexec to execute command in our (v1) cgroup
+            mncmd = kwargs.pop(
+                "mncmd",
+                [ "mnexec", "-g", self.name, "-da", str( self.pid ) ]
+            )
+
+        # RT priority handling is only meaningful under cgroup v1.
+        # cgroup v2 does not expose rt_runtime_us, and sched='rt' is
+        # rejected in initCgroups, so we skip this entirely for v2.
+        if self.sched == "rt" and self.cgversion != "cgroup2":
+            # if our cgroup is not given any cpu time,
+            # we cannot assign the RR Scheduler.
+            if int( self.cgroupGet( "rt_runtime_us", "cpu" ) ) <= 0:
+                mncmd += [ "-r", str( self.rtprio ) ]
             else:
-                debug( '*** error: not enough cpu time available for %s.' %
-                       self.name, 'Using cfs scheduler for subprocess\n' )
-        return Host.popen( self, *args, mncmd=mncmd, **kwargs )
+                debug(
+                    "*** error: not enough cpu time available "
+                    "for %s. Using cfs scheduler for subprocess\n"
+                    % self.name
+                )
+
+        popen = Host.popen(
+            self,
+            *args,
+            mncmd=mncmd,
+            **kwargs
+        )
+
+        if self.cgversion == "cgroup2":
+            # Move the spawned process into our cgroup
+            try:
+                with open( self.cgroup_path / "cgroup.procs", "w" ) as f:
+                    f.write( str( popen.pid ) )
+            except OSError:
+                warn( "*** Warning: could not add pid %s to cgroup %s\n"
+                      % ( popen.pid, self.name ) )
+
+        return popen
 
     def cleanup( self ):
         "Clean up Node, then clean up our cgroup"
@@ -827,6 +989,13 @@ class CPULimitedHost( Host ):
         if not sched:
             sched = self.sched
         if sched == 'rt':
+            # RT bandwidth control is not available under cgroup v2.
+            if self.cgversion == 'cgroup2':
+                raise Exception(
+                    "*** error: RT scheduling (sched='rt') is not "
+                    "supported under cgroup v2. "
+                    "Please use sched='cfs' instead.\n"
+                )
             if not f or f < 0:
                 raise Exception( 'Please set a positive CPU fraction'
                                  ' for sched=rt\n' )
@@ -840,6 +1009,7 @@ class CPULimitedHost( Host ):
             setPeriod = self.cgroupSet( pstr, period )
             setQuota = self.cgroupSet( qstr, quota )
         else:
+            # cgroup v2: cpu.max takes "<quota> <period>" on one line
             setQuota, setPeriod = self.cgroupSet(
                     pstr, '%s %s' % (quota, period) ).split()
         if sched == 'rt':
@@ -859,10 +1029,15 @@ class CPULimitedHost( Host ):
         # must specify it anyway
         self.cgroupSet( resource='cpuset', param='mems',
                         value=mems)
-        # We have to do this here after we've specified
-        # cpus and mems
-        errFail( 'cgclassify -g cpuset:/%s %s' % (
-                 self.name, self.pid ) )
+        # Under cgroup v1 we must (re)classify the process into the
+        # cpuset hierarchy after specifying cpus and mems. Under cgroup
+        # v2 the process is already a member of our unified cgroup (it
+        # was added to cgroup.procs in initCgroups), so this step is
+        # unnecessary and the v1 'cgclassify -g cpuset:/...' syntax is
+        # not valid.
+        if self.cgversion != 'cgroup2':
+            errFail( 'cgclassify -g cpuset:/%s %s' % (
+                     self.name, self.pid ) )
 
     # pylint: disable=arguments-differ
     def config( self, cpu=-1, cores=None, **params ):

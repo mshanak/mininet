@@ -863,6 +863,38 @@ class Mininet( object ):
         output( '*** Results: %s\n' % result )
         return result
 
+    @staticmethod
+    def _cpuTimeNs( host ):
+        """Return total CPU usage of a host's cgroup, in nanoseconds.
+           Transparently supports both cgroup v1 and cgroup v2.
+
+           cgroup v1: /sys/fs/cgroup/cpuacct/<host>/cpuacct.usage  (ns)
+           cgroup v2: /sys/fs/cgroup/<host>/cpu.stat  ->  usage_usec (us)
+
+           host: the (CPULimited) Host object whose cgroup is named host.name
+        """
+        # Determine cgroup version. CPULimitedHost exposes 'cgversion';
+        # default to cgroup v2 (the modern default on Ubuntu 22.04+/26.04).
+        cgversion = getattr( host, 'cgversion', 'cgroup2' )
+
+        if cgversion != 'cgroup2':
+            # ---- cgroup v1: cpuacct.usage is already in nanoseconds ----
+            path = '/sys/fs/cgroup/cpuacct/%s/cpuacct.usage' % host
+            with open( path, 'r' ) as f:
+                return float( f.read() )
+
+        # ---- cgroup v2: read usage_usec (microseconds) from cpu.stat ----
+        path = '/sys/fs/cgroup/%s/cpu.stat' % host
+        with open( path, 'r' ) as f:
+            for line in f:
+                if line.startswith( 'usage_usec' ):
+                    usec = float( line.split()[ 1 ] )
+                    # Convert microseconds -> nanoseconds so that the
+                    # rest of the math is identical to the v1 path.
+                    return usec * 1000.0
+        # If usage_usec wasn't found, treat as zero usage.
+        return 0.0
+
     def runCpuLimitTest( self, cpu, duration=5 ):
         """run CPU limit test with 'while true' processes.
         cpu: desired CPU fraction of each host
@@ -883,18 +915,14 @@ class Mininet( object ):
                 pids[ h ].append( h.cmd( 'echo $!' ).strip() )
         outputs = {}
         time = {}
-        # get the initial cpu time for each host
+        # get the initial cpu time for each host (in nanoseconds)
         for host in hosts:
             outputs[ host ] = []
-            with open( '/sys/fs/cgroup/cpuacct/%s/cpuacct.usage' %
-                       host, 'r' ) as f:
-                time[ host ] = float( f.read() )
+            time[ host ] = self._cpuTimeNs( host )
         for _ in range( duration ):
             sleep( 1 )
             for host in hosts:
-                with open( '/sys/fs/cgroup/cpuacct/%s/cpuacct.usage' %
-                           host, 'r' ) as f:
-                    readTime = float( f.read() )
+                readTime = self._cpuTimeNs( host )
                 outputs[ host ].append( ( ( readTime - time[ host ] )
                                         / 1000000000 ) / cores * 100 )
                 time[ host ] = readTime

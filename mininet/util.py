@@ -549,25 +549,68 @@ def fixLimits():
               "Mininet's performance may be affected.\n" )
     # pylint: enable=broad-except
 
+
 def mountCgroups( cgcontrol='cpu cpuacct cpuset' ):
-    """Mount cgroupfs if needed and return cgroup version
-       cgcontrol: cgroup controllers to check ('cpu cpuacct cpuset')
+    """Mount cgroupfs if needed and return cgroup version.
+
+       Uses the kernel's built-in mount support instead of the
+       obsolete 'cgroupfs-mount' helper script (which is not shipped
+       on Ubuntu 22.04+/26.04, where cgroup v2 is the default).
+
+       cgcontrol: cgroup v1 controllers to check ('cpu cpuacct cpuset')
        Returns: 'cgroup' | 'cgroup2' """
-    # Try to read the cgroup controllers in cgcontrol
+    cgroupRoot = '/sys/fs/cgroup'
+
+    def mountType( path ):
+        "Return the filesystem type mounted at path, or '' if none."
+        out, _, ret = errRun( [ 'stat', '-fc', '%T', path ] )
+        return out.strip() if ret == 0 else ''
+
+    # 1) cgroup v2 (unified hierarchy) -- the modern default,
+    #    already mounted at boot by systemd on Ubuntu 22.04+/26.04.
+    if mountType( cgroupRoot ) == 'cgroup2fs':
+        return 'cgroup2'
+
+    # 2) cgroup v1: check whether the requested controllers are present.
     cglist = cgcontrol.split()
     paths = ' '.join( '-g ' + c for c in cglist )
     cmd = 'cgget -n %s /' % paths
     result = errRun( cmd )
-    # If it failed, mount cgroupfs and retry
-    if result.ret or result.err or any(
-            c not in result.out for c in cglist ):
-        errFail( 'cgroupfs-mount' )
+
+    needMount = ( result.ret or result.err or
+                  any( c not in result.out for c in cglist ) )
+
+    if needMount:
+        # Try to mount using the kernel's built-in cgroup support.
+        # First make sure the mount point exists.
+        errRun( [ 'mkdir', '-p', cgroupRoot ] )
+
+        # Prefer the unified v2 hierarchy if the system supports it.
+        v2 = errRun( [ 'mount', '-t', 'cgroup2', 'cgroup2', cgroupRoot ] )
+        if not v2.ret and mountType( cgroupRoot ) == 'cgroup2fs':
+            return 'cgroup2'
+
+        # Otherwise fall back to mounting the requested v1 controllers.
+        for c in cglist:
+            cpath = '%s/%s' % ( cgroupRoot, c )
+            errRun( [ 'mkdir', '-p', cpath ] )
+            errRun( [ 'mount', '-t', 'cgroup',
+                      '-o', c, 'cgroup', cpath ] )
+
+        # Re-check that the v1 controllers are now available.
         result = errRun( cmd )
-        errFail( cmd )
-    # cpu.cfs_period_us is used for cgroup but not cgroup2
+        if ( result.ret or result.err or
+                any( c not in result.out for c in cglist ) ):
+            raise Exception(
+                "mountCgroups: could not find or mount cgroup "
+                "controllers %s. On cgroup v2-only systems, "
+                "CPULimitedHost may be unsupported." % cgcontrol )
+
+    # cpu.cfs_period_us exists only under cgroup v1.
     if 'cpu.cfs_period_us' in result.out:
         return 'cgroup'
     return 'cgroup2'
+
 
 def natural( text ):
     "To sort sanely/alphabetically: sorted( l, key=natural )"
